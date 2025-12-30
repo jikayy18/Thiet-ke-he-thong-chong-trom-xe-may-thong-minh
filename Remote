@@ -1,0 +1,124 @@
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+#define CE_PIN  9
+#define CSN_PIN 10
+#define LED_PIN 2
+#define BTN_LED 4       // Button điều khiển LED
+#define BTN_BUZZ 6      // Button điều khiển buzzer
+
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[6] = "TEST1";
+
+// ===== DATA PACKET =====
+struct Packet {
+  uint8_t counter;
+  uint8_t ledToggle;       // Toggle LED
+  uint8_t buzzerToggle;    // Toggle buzzer
+};
+
+uint8_t counter = 0;
+uint8_t ledPressId = 0;
+uint8_t buzzPressId = 0;
+
+// ===== Debounce parameters =====
+bool lastReadingLED = HIGH, lastStableLED = HIGH;
+unsigned long lastDebounceLED = 0;
+
+bool lastReadingBUZZ = HIGH, lastStableBUZZ = HIGH;
+unsigned long lastDebounceBUZZ = 0;
+
+const unsigned long debounceDelay = 40;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BTN_LED, INPUT_PULLUP);
+  pinMode(BTN_BUZZ, INPUT_PULLUP);
+
+  if (!radio.begin()) {
+    Serial.println("NRF INIT FAIL");
+    while (1);
+  }
+
+  radio.setChannel(76);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setAutoAck(false);
+  radio.disableDynamicPayloads();
+  radio.setPayloadSize(sizeof(Packet));
+  radio.openWritingPipe(address);
+  radio.stopListening();
+
+  Serial.println("NANO NRF READY");
+}
+
+void loop() {
+
+  // ===========================
+  //  BUTTON LED (D4)
+  // ===========================
+  bool readingLED = digitalRead(BTN_LED);
+
+  if (readingLED != lastReadingLED) {
+    lastDebounceLED = millis();
+  }
+  if (millis() - lastDebounceLED > debounceDelay) {
+    if (readingLED != lastStableLED) {
+      lastStableLED = readingLED;
+
+      if (lastStableLED == LOW) {
+        ledPressId++;
+        Serial.print("LED BUTTON pressed -> ledPressId = ");
+        Serial.println(ledPressId);
+      }
+    }
+  }
+  lastReadingLED = readingLED;
+
+  // ===========================
+  //  BUTTON BUZZER (D6)
+  // ===========================
+  bool readingBUZZ = digitalRead(BTN_BUZZ);
+
+  if (readingBUZZ != lastReadingBUZZ) {
+    lastDebounceBUZZ = millis();
+  }
+  if (millis() - lastDebounceBUZZ > debounceDelay) {
+    if (readingBUZZ != lastStableBUZZ) {
+      lastStableBUZZ = readingBUZZ;
+
+      if (lastStableBUZZ == LOW) {
+        buzzPressId++;
+        Serial.print("BUZZER BUTTON pressed -> buzzPressId = ");
+        Serial.println(buzzPressId);
+      }
+    }
+  }
+  lastReadingBUZZ = readingBUZZ;
+
+  // ===========================
+  //  PACK & SEND NRF24
+  // ===========================
+  Packet pkt;
+  pkt.counter = counter++;
+  pkt.ledToggle = ledPressId;
+  pkt.buzzerToggle = buzzPressId;
+
+  bool ok = radio.write(&pkt, sizeof(pkt));
+
+  Serial.print("[TX] cnt=");
+  Serial.print(pkt.counter);
+  Serial.print(" LEDid=");
+  Serial.print(pkt.ledToggle);
+  Serial.print(" BUZZid=");
+  Serial.print(pkt.buzzerToggle);
+  Serial.print(" -> ");
+  Serial.println(ok ? "OK" : "NO_ACK");
+
+  digitalWrite(LED_PIN, ok ? HIGH : LOW);
+
+  delay(90);
+}
