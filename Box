@@ -1,0 +1,519 @@
+/************************************************************
+ * ESP32-S + A7680C (4G) + Blynk + NRF24 + GPS + Relay + Buzzer
+ *
+ * ✅ KHÔNG dùng WiFi router
+ * ✅ Blynk chạy bằng 4G (A7680C) qua TinyGSM
+ * ✅ Terminal (V2): gõ "sms" -> gửi SMS GPS về điện thoại
+ * ✅ NRF24 từ Nano (packet giống code Nano bạn gửi):
+ *    - ledToggle thay đổi -> TOGGLE relay (đồng bộ Blynk V1)
+ *    - buzzerToggle thay đổi -> buzzer kêu 10 lần rồi dừng (KHÔNG gửi SMS)
+ * ✅ Khi TẮT relay (đỗ xe) -> lưu vị trí đỗ + gửi SMS vị trí đỗ về điện thoại
+ * ✅ Nếu xe bị dịch chuyển > 10m từ điểm đỗ -> còi kêu liên tục + SMS 1 phút/lần
+ * ✅ Relay ACTIVE HIGH (bật relay = HIGH)
+ * ✅ Nút tắt còi trên Blynk: V3 (1 = tắt còi/clear alarm, 0 = không dùng)
+ ************************************************************/
+
+// ===================== BLYNK CONFIG ======================
+#define BLYNK_TEMPLATE_ID   "TMPL6HmrvPlhp"
+#define BLYNK_TEMPLATE_NAME "DinhViXe"
+#define BLYNK_AUTH_TOKEN    "7ORzo02oUEeOHXb9nTEwd8dgdPA3YPtH"
+
+// ===================== TINY GSM CONFIG ===================
+#define TINY_GSM_MODEM_SIM7600      // A7680C thuộc họ A76xx, dùng profile SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+#define BLYNK_PRINT Serial
+// #define TINY_GSM_DEBUG Serial     // bật nếu cần log modem
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+#include <TinyGsmClient.h>
+#include <BlynkSimpleTinyGSM.h>
+
+// ===================== APN (Viettel) =====================
+const char apn[]      = "v-internet";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+// ===================== PINS ==============================
+#define CE_PIN      4
+#define CSN_PIN     5
+
+#define RELAY_PIN   25      // ✅ Relay ACTIVE HIGH
+#define LED_ERROR   26
+#define BUZZER_PIN  33
+
+// GPS UART1
+#define GPS_RX 21
+#define GPS_TX 22
+
+// SIM UART2
+#define SIM_RX     16
+#define SIM_TX     17
+#define SIM_EN_PIN 15
+#define SIM_BAUD   115200
+
+// ===================== PHONE =============================
+#define PHONE_NUMBER "+84349294684"
+
+// ===================== THRESHOLDS ========================
+#define ALARM_DISTANCE_M   10.0
+#define SMS_INTERVAL_MS    60000UL   // 1 phút
+
+// ===================== BLYNK WIDGETS =====================
+BlynkTimer timer;
+WidgetTerminal terminal(V2);
+
+// ===================== MODEM/BLYNK over SIM ===============
+HardwareSerial SIM_Serial(2);
+TinyGsm modem(SIM_Serial);
+
+// ===================== NRF24 =============================
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[6] = "TEST1";
+
+// Packet giống code Nano bạn gửi
+struct Packet {
+  uint8_t counter;
+  uint8_t ledToggle;      // Nano button LED
+  uint8_t buzzerToggle;   // Nano button BUZZ
+};
+
+static uint8_t lastLedId  = 0;
+static uint8_t lastBuzzId = 0;
+volatile unsigned long lastRx = 0;
+
+// ===================== GPS ===============================
+HardwareSerial GPS_Serial(1);
+TinyGPSPlus gps;
+
+volatile float lastLat = 0;
+volatile float lastLon = 0;
+volatile bool  gpsHasFix = false;
+
+// ===================== STATES ============================
+volatile bool relayState = false;     // logic ON/OFF
+
+volatile bool buzzerPulse = false;    // 🔔 kêu 10 lần (nút Nano)
+volatile bool alarmActive = false;    // 🚨 kêu liên tục (dịch chuyển >10m)
+
+// Điểm đỗ xe
+volatile bool   parkValid = false;
+volatile double parkLat = 0;
+volatile double parkLon = 0;
+
+// SMS queue (chỉ gửi trong loop)
+volatile bool smsSendFlag = false;
+String smsTextPending = "";
+
+// Sync relay lên Blynk (chỉ làm trong loop)
+volatile bool flagRelaySyncToBlynk = false;
+volatile int  relaySyncValue = 0;
+
+// Terminal flags
+volatile bool flagPrintSmsOK   = false;
+volatile bool flagPrintSmsFail = false;
+
+// =========================================================
+//                      HELPERS
+// =========================================================
+double gpsDistanceMeter(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0;
+  double dLat = radians(lat2 - lat1);
+  double dLon = radians(lon2 - lon1);
+  double a = sin(dLat/2)*sin(dLat/2) +
+             cos(radians(lat1))*cos(radians(lat2)) *
+             sin(dLon/2)*sin(dLon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+String buildGpsSms(float lat, float lon) {
+  String sms = "GPS Vehicle Location:\n";
+  sms += "Lat: " + String(lat, 6) + "\n";
+  sms += "Lon: " + String(lon, 6) + "\n";
+  sms += "https://www.google.com/maps/?q=" + String(lat, 6) + "," + String(lon, 6);
+  return sms;
+}
+
+// Relay ACTIVE HIGH + logic: TẮT relay = lưu điểm đỗ + gửi SMS
+inline void setRelay(bool on) {
+  bool prev = relayState;
+  relayState = on;
+
+  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+
+  // Đồng bộ Blynk V1 (làm ở loop)
+  relaySyncValue = relayState ? 1 : 0;
+  flagRelaySyncToBlynk = true;
+
+  // Khi TẮT relay (on: true -> false) => coi như đỗ xe
+  if (prev == true && on == false) {
+    // reset alarm khi vừa đỗ lại
+    alarmActive = false;
+
+    if (gpsHasFix) {
+      parkLat = lastLat;
+      parkLon = lastLon;
+      parkValid = true;
+
+      smsTextPending = "PARKING LOCATION:\n" + buildGpsSms(lastLat, lastLon);
+      smsSendFlag = true; // gửi trong loop
+      Serial.println("[PARK] Saved + SMS queued");
+    } else {
+      // Không có GPS fix vẫn lưu trạng thái đỗ (nhưng không có tọa độ)
+      parkValid = false;
+      Serial.println("[PARK] No GPS fix -> cannot save location");
+    }
+  }
+}
+
+// =========================================================
+//                      TASKS
+// =========================================================
+void TaskBuzzer(void *pv) {
+  for (;;) {
+    // 🚨 ALARM MODE: kêu liên tục
+    if (alarmActive) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      vTaskDelay(300 / portTICK_PERIOD_MS);
+      digitalWrite(BUZZER_PIN, LOW);
+      vTaskDelay(300 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    // 🔔 PULSE MODE: kêu 10 lần khi bấm nút buzzer bên Nano
+    if (buzzerPulse) {
+      buzzerPulse = false;
+      for (int i = 0; i < 10; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        vTaskDelay(120 / portTICK_PERIOD_MS);
+        digitalWrite(BUZZER_PIN, LOW);
+        vTaskDelay(80 / portTICK_PERIOD_MS);
+      }
+    }
+
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+void TaskGPS(void *pv) {
+  for (;;) {
+    while (GPS_Serial.available()) {
+      gps.encode(GPS_Serial.read());
+    }
+
+    if (gps.location.isUpdated() && gps.location.isValid()) {
+      lastLat = gps.location.lat();
+      lastLon = gps.location.lng();
+      gpsHasFix = true;
+
+      // Nếu đã có điểm đỗ -> so sánh dịch chuyển
+      if (parkValid) {
+        double d = gpsDistanceMeter(parkLat, parkLon, lastLat, lastLon);
+        if (d >= ALARM_DISTANCE_M) {
+          alarmActive = true; // bật còi liên tục
+        }
+      }
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+void TaskNRF(void *pv) {
+  for (;;) {
+    if (radio.available()) {
+      Packet pkt;
+      radio.read(&pkt, sizeof(pkt));
+      lastRx = millis();
+      digitalWrite(LED_ERROR, LOW);
+
+      Serial.printf("[NRF] cnt=%u LEDid=%u BUZZid=%u\n",
+                    pkt.counter, pkt.ledToggle, pkt.buzzerToggle);
+
+      // LED button: toggle relay
+      if (pkt.ledToggle != lastLedId) {
+        lastLedId = pkt.ledToggle;
+        setRelay(!relayState);
+        Serial.println(relayState ? "[RELAY] ON" : "[RELAY] OFF");
+      }
+
+      // BUZZ button: chỉ kêu 10 lần, KHÔNG SMS
+      if (pkt.buzzerToggle != lastBuzzId) {
+        lastBuzzId = pkt.buzzerToggle;
+        buzzerPulse = true;
+      }
+    }
+
+    vTaskDelay(8 / portTICK_PERIOD_MS);
+  }
+}
+
+void TaskWatchdog(void *pv) {
+  for (;;) {
+    if (millis() - lastRx > 1500) digitalWrite(LED_ERROR, HIGH);
+    else                          digitalWrite(LED_ERROR, LOW);
+    vTaskDelay(300 / portTICK_PERIOD_MS);
+  }
+}
+
+// =========================================================
+//                 BLYNK HANDLERS
+// =========================================================
+BLYNK_CONNECTED() {
+  // đồng bộ trạng thái relay lên app khi vừa connect
+  Blynk.virtualWrite(V1, relayState ? 1 : 0);
+  terminal.println("Blynk connected!");
+  terminal.flush();
+}
+
+// V1: công tắc relay trên app (0/1)
+BLYNK_WRITE(V1) {
+  bool on = param.asInt() ? true : false;
+  setRelay(on);
+}
+
+// V2: Terminal commands
+//  - "sms"  : gửi SMS vị trí hiện tại
+//  - "alarm0": tắt còi (clear alarm) (tuỳ chọn)
+//  - "park0" : xoá điểm đỗ (tuỳ chọn)
+BLYNK_WRITE(V2) {
+  String cmd = param.asStr();
+  cmd.trim();
+  cmd.toLowerCase();
+
+  if (cmd == "sms") {
+    if (!gpsHasFix) {
+      terminal.println("GPS NO FIX -> cannot send SMS");
+      terminal.flush();
+    } else {
+      smsTextPending = buildGpsSms(lastLat, lastLon);
+      smsSendFlag = true;
+      terminal.println("SMS requested...");
+      terminal.flush();
+    }
+  } else if (cmd == "alarm0") {
+    alarmActive = false;
+    terminal.println("Alarm OFF");
+    terminal.flush();
+  } else if (cmd == "park0") {
+    parkValid = false;
+    terminal.println("Parking point cleared");
+    terminal.flush();
+  } else {
+    terminal.println("Commands:");
+    terminal.println("  sms");
+    terminal.println("  alarm0");
+    terminal.println("  park0");
+    terminal.flush();
+  }
+}
+
+// V3: nút tắt còi chủ động (1 = tắt còi)
+BLYNK_WRITE(V3) {
+  int v = param.asInt();
+  if (v == 1) {
+    alarmActive = false;
+    Blynk.virtualWrite(V3, 0); // auto reset nút về 0
+  }
+}
+
+// =========================================================
+//                    TERMINAL TIMER
+// =========================================================
+void cbSendGpsToTerminal() {
+  if (!Blynk.connected()) return;
+
+  if (gpsHasFix) terminal.printf("GPS -> Lat: %.6f | Lon: %.6f\n", lastLat, lastLon);
+  else          terminal.println("GPS -> NO FIX");
+
+  terminal.flush();
+}
+
+// =========================================================
+//               CELLULAR + BLYNK SETUP
+// =========================================================
+bool setupCellularAndBlynk() {
+  Serial.println("[SIM] Power enable...");
+  pinMode(SIM_EN_PIN, OUTPUT);
+  digitalWrite(SIM_EN_PIN, LOW);
+
+  delay(8000); // boot time module
+
+  Serial.println("[SIM] UART begin...");
+  SIM_Serial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX, SIM_TX);
+  delay(200);
+
+  Serial.println("[SIM] modem.restart() ...");
+  if (!modem.restart()) {
+    Serial.println("[SIM] restart FAIL");
+    return false;
+  }
+
+  Serial.println("[SIM] waitForNetwork...");
+  if (!modem.waitForNetwork(60000L)) {
+    Serial.println("[SIM] no network");
+    return false;
+  }
+
+  Serial.print("[SIM] Operator: ");
+  Serial.println(modem.getOperator());
+
+  Serial.print("[SIM] CSQ: ");
+  Serial.println(modem.getSignalQuality());
+
+  Serial.println("[SIM] gprsConnect...");
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+    Serial.println("[SIM] gprsConnect FAIL");
+    return false;
+  }
+
+  Serial.print("[SIM] IP: ");
+  Serial.println(modem.localIP());
+
+  Serial.println("[BLYNK] config + connect...");
+  Blynk.config(modem, BLYNK_AUTH_TOKEN);
+
+  if (!Blynk.connect(15000)) {
+    Serial.println("[BLYNK] connect FAIL");
+    return false;
+  }
+
+  Serial.println("[BLYNK] CONNECTED via SIM!");
+  return true;
+}
+
+// =========================================================
+//                        SETUP
+// =========================================================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_ERROR, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(LED_ERROR, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  setRelay(false); // relay OFF
+
+  // NRF24 init
+  Serial.println("[NRF] init...");
+  if (!radio.begin()) {
+    Serial.println("[NRF] radio.begin FAILED");
+    digitalWrite(LED_ERROR, HIGH);
+    while (1) delay(100);
+  }
+  radio.setChannel(76);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setAutoAck(false);
+  radio.disableDynamicPayloads();
+  radio.setPayloadSize(sizeof(Packet));
+  radio.openReadingPipe(1, address);
+  radio.startListening();
+  Serial.println("[NRF] READY");
+
+  // GPS init
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("[GPS] UART READY");
+
+  // Cellular + Blynk
+  bool ok = setupCellularAndBlynk();
+  Serial.println(ok ? "[SYS] CELL+BLYNK OK" : "[SYS] CELL+BLYNK FAIL (will retry in loop)");
+
+  // Timer: gửi GPS lên terminal mỗi 2s
+  timer.setInterval(2000L, cbSendGpsToTerminal);
+
+  // Tasks
+  xTaskCreatePinnedToCore(TaskGPS,      "GPS",      4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(TaskNRF,      "NRF",      4096, NULL, 4, NULL, 1);
+  xTaskCreatePinnedToCore(TaskWatchdog, "Watchdog", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskBuzzer,   "Buzzer",   2048, NULL, 4, NULL, 1);
+
+  Serial.println("[SYS] ALL STARTED");
+}
+
+// =========================================================
+//                         LOOP
+// =========================================================
+unsigned long lastNetCheck   = 0;
+unsigned long lastBlynkRetry = 0;
+unsigned long lastAlarmSMS   = 0;
+
+void loop() {
+  delay(2); // tránh SW_CPU_RESET
+
+  // --- giữ network/GPRS ---
+  if (millis() - lastNetCheck > 3000) {
+    lastNetCheck = millis();
+
+    if (!modem.isNetworkConnected()) {
+      Serial.println("[SIM] Network lost -> waitForNetwork...");
+      modem.waitForNetwork(60000L);
+    }
+    if (!modem.isGprsConnected()) {
+      Serial.println("[SIM] GPRS lost -> reconnect...");
+      modem.gprsConnect(apn, gprsUser, gprsPass);
+    }
+  }
+
+  // --- Blynk reconnect ---
+  if (!Blynk.connected()) {
+    if (millis() - lastBlynkRetry > 3000) {
+      lastBlynkRetry = millis();
+      Serial.println("[BLYNK] reconnect...");
+      Blynk.connect(3000);
+    }
+  }
+
+  Blynk.run();
+  timer.run();
+
+  // --- sync relay state lên app (để không bị bấm 2 lần) ---
+  if (flagRelaySyncToBlynk && Blynk.connected()) {
+    flagRelaySyncToBlynk = false;
+    Blynk.virtualWrite(V1, relaySyncValue);
+  }
+
+  // --- nếu đang ALARM: gửi SMS mỗi 1 phút ---
+  if (alarmActive && gpsHasFix && (millis() - lastAlarmSMS >= SMS_INTERVAL_MS)) {
+    lastAlarmSMS = millis();
+    smsTextPending = "ALERT! VEHICLE MOVED!\n" + buildGpsSms(lastLat, lastLon);
+    smsSendFlag = true;
+  }
+
+  // --- send SMS (CHỈ trong loop) ---
+  if (smsSendFlag) {
+    smsSendFlag = false;
+
+    if (!gpsHasFix) {
+      flagPrintSmsFail = true;
+    } else {
+      Serial.println("[SIM] Sending SMS...");
+      bool ok = modem.sendSMS(PHONE_NUMBER, smsTextPending);
+      if (ok) flagPrintSmsOK = true;
+      else    flagPrintSmsFail = true;
+    }
+  }
+
+  // --- in trạng thái SMS lên terminal ---
+  if (flagPrintSmsOK && Blynk.connected()) {
+    flagPrintSmsOK = false;
+    terminal.println("SMS SENT OK");
+    terminal.flush();
+  }
+  if (flagPrintSmsFail && Blynk.connected()) {
+    flagPrintSmsFail = false;
+    terminal.println("SMS SEND FAIL");
+    terminal.flush();
+  }
+}
