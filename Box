@@ -59,7 +59,7 @@ const char gprsPass[] = "";
 #define SIM_BAUD   115200
 
 // ===================== PHONE =============================
-#define PHONE_NUMBER "+84349294684"
+#define PHONE_NUMBER "+84xxxxxxxx"
 
 // ===================== THRESHOLDS ========================
 #define ALARM_DISTANCE_M   10.0
